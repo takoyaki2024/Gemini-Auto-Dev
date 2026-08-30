@@ -7,18 +7,20 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
     $python = 'python'
 } else {
-    throw 'Python が見つかりません。Python をインストールしてから再実行してください。'
+    throw 'Python was not found. Install Python and run setup.ps1 again.'
 }
 
 if (-not (Test-Path '.venv\Scripts\python.exe')) {
+    Write-Host 'Creating virtual environment...'
     & $python -m venv .venv
 }
 
+Write-Host 'Installing dependencies...'
 & '.\.venv\Scripts\python.exe' -m pip install --upgrade pip
 & '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt
 
 if (-not $env:GEMINI_API_KEY) {
-    $secure = Read-Host 'Gemini API key を入力してください' -AsSecureString
+    $secure = Read-Host 'Enter Gemini API key' -AsSecureString
     $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try {
         $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
@@ -31,6 +33,12 @@ if (-not $env:GEMINI_API_KEY) {
     }
 }
 
+Write-Host 'Running tests...'
 & '.\.venv\Scripts\python.exe' -m pytest -q
+if ($LASTEXITCODE -ne 0) {
+    throw 'Tests failed.'
+}
+
 Write-Host 'Setup complete.'
-Write-Host '起動例: .\run.ps1 -Workspace D:\GitHub\YourProject -Task "このプロジェクトを完成させて"'
+Write-Host 'Example:'
+Write-Host '.\run.ps1 -Workspace D:\GitHub\YourProject -Task "Complete this project and run tests"'
