@@ -156,5 +156,6 @@ LATEST EXECUTION EVIDENCE:
             if review.approved:
                 if self.config.get("auto_commit", True):
                     self.git.checkpoint(f"auto-dev: {task[:72]}")
+                self.state.add("completed", {"task": task})
                 return "COMPLETED: task implemented, reviewed, and checkpointed."
             latest_failure = "REVIEW_NOT_APPROVED:\n" + (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
