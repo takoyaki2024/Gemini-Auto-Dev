@@ -13,12 +13,11 @@ billing:
   auto_upgrade: false
 
 local_ai:
-  enabled: true
+  enabled: false
   endpoint: http://127.0.0.1:11434
   model: qwen3:4b
-  timeout_seconds: 90
-  role: context_selection_only
-  max_selected_files: 12
+  timeout_seconds: 30
+  role: optional_light_tasks_only
 
 gemini:
   max_retries: 2
@@ -28,6 +27,8 @@ gemini:
 
 context:
   max_chars: 80000
+  max_files: 12
+  selector: deterministic
 
 workers:
   max_parallel: 1
