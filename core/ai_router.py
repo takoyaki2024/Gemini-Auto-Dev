@@ -22,15 +22,24 @@ class AIRouter:
         self.local = LocalAIClient(
             endpoint=str(local.get("endpoint", "http://127.0.0.1:11434")),
             model=str(local.get("model", "")),
-            timeout=int(local.get("timeout_seconds", 180)),
+            timeout=int(local.get("timeout_seconds", 90)),
         )
 
-    def structured(self, system: str, prompt: str, schema: type[T], prefer_local: bool = True) -> tuple[T, str]:
-        if self.local_enabled and prefer_local:
-            try:
-                result = self.local.structured(system, prompt, schema)
-                return result, "local"
-            except LocalAIUnavailable as exc:
-                print(f"Local AI unavailable; escalating to Gemini: {exc}")
+    def local_structured(self, system: str, prompt: str, schema: type[T]) -> T | None:
+        if not self.local_enabled:
+            return None
+        try:
+            return self.local.structured(system, prompt, schema)
+        except LocalAIUnavailable as exc:
+            print(f"Local helper skipped: {exc}")
+            return None
 
-        return self.gemini.structured(system, prompt, schema), "gemini"
+    def gemini_structured(self, system: str, prompt: str, schema: type[T]) -> T:
+        return self.gemini.structured(system, prompt, schema)
+
+    def structured(self, system: str, prompt: str, schema: type[T], prefer_local: bool = False) -> tuple[T, str]:
+        if prefer_local:
+            result = self.local_structured(system, prompt, schema)
+            if result is not None:
+                return result, "local"
+        return self.gemini_structured(system, prompt, schema), "gemini"
