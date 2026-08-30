@@ -6,6 +6,7 @@ from core.ai_router import AIRouter
 from core.context_builder import ContextBuilder
 from core.gemini_client import GeminiQuotaPaused, GeminiTemporaryUnavailable
 from core.models import DevPlan, ReviewResult
+from core.preflight import PreflightDetector
 from core.state_store import StateStore
 from core.task_manager import DeterministicTaskManager
 from tools.security_gate import SecurityGate
@@ -67,16 +68,7 @@ class Orchestrator:
             return "TEMPORARILY_UNAVAILABLE"
 
     def _save_resume(self, task: str, phase: str, latest_failure: str = "", evidence: str = "", plan: DevPlan | None = None, repeated: int = 0, last_sig: str = "", escape_used: int = 0) -> None:
-        self.state.save_resume({
-            "task": task,
-            "phase": phase,
-            "latest_failure": latest_failure,
-            "evidence": evidence[-30000:],
-            "plan": plan.model_dump() if plan else None,
-            "repeated": repeated,
-            "last_sig": last_sig,
-            "escape_used": escape_used,
-        })
+        self.state.save_resume({"task": task, "phase": phase, "latest_failure": latest_failure, "evidence": evidence[-30000:], "plan": plan.model_dump() if plan else None, "repeated": repeated, "last_sig": last_sig, "escape_used": escape_used})
 
     def _select_context(self, task: str, latest_failure: str = "") -> str:
         project, files = self.context.build_relevant(task, latest_failure, self.max_context_files)
@@ -84,9 +76,23 @@ class Orchestrator:
         self.state.add("context_selection", {"backend": "deterministic", "files": files})
         return project
 
+    def _run_preflight(self) -> str:
+        cfg = self.config.get("preflight", {})
+        if not cfg.get("enabled", True):
+            return ""
+        check = PreflightDetector(self.workspace).detect()
+        if not check.command:
+            print(f"Preflight: {check.project_type} | no safe check detected")
+            self.state.add("preflight", {"project_type": check.project_type, "command": None})
+            return ""
+        print(f"Preflight: {check.project_type} | {check.command}")
+        result = self.runner.run(check.command)
+        text = result.text()[-20000:]
+        self.state.add("preflight", {"project_type": check.project_type, "command": check.command, "code": result.code, "output": text})
+        return f"PREFLIGHT BEFORE CHANGES:\n{text}"
+
     def _apply_plan(self, plan: DevPlan) -> tuple[list[str], list[int]]:
-        logs: list[str] = []
-        command_codes: list[int] = []
+        logs, command_codes = [], []
         for action in plan.actions:
             self.files.apply(action)
             logs.append(f"{action.type}: {action.path}")
@@ -102,19 +108,12 @@ class Orchestrator:
 
     def _deterministic_review_ok(self, plan: DevPlan, command_codes: list[int]) -> bool:
         review_cfg = self.config.get("review", {})
-        if not review_cfg.get("deterministic_first", True):
+        if not review_cfg.get("deterministic_first", True) or (review_cfg.get("require_command_evidence", True) and not command_codes) or any(code != 0 for code in command_codes):
             return False
-        if review_cfg.get("require_command_evidence", True) and not command_codes:
-            return False
-        if any(code != 0 for code in command_codes):
-            return False
-        max_actions = int(review_cfg.get("max_actions_without_gemini", 6))
-        if len(plan.actions) > max_actions:
+        if len(plan.actions) > int(review_cfg.get("max_actions_without_gemini", 6)):
             return False
         risky_suffixes = {".ps1", ".bat", ".cmd", ".sh", ".yml", ".yaml"}
-        if any(Path(action.path).suffix.lower() in risky_suffixes for action in plan.actions):
-            return False
-        return plan.done
+        return plan.done and not any(Path(action.path).suffix.lower() in risky_suffixes for action in plan.actions)
 
     def _complete(self, task: str, review_backend: str) -> str:
         if self.config.get("auto_commit", True):
@@ -124,9 +123,7 @@ class Orchestrator:
 
     @staticmethod
     def _pause_message(code: str) -> str:
-        if code == "QUOTA_PAUSED":
-            return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. Resume snapshot was saved; development stopped."
-        return "PAUSED: TEMPORARILY_UNAVAILABLE. Resume snapshot was saved; retry later."
+        return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. Resume snapshot was saved; development stopped." if code == "QUOTA_PAUSED" else "PAUSED: TEMPORARILY_UNAVAILABLE. Resume snapshot was saved; retry later."
 
     def run(self, task: str, resume: dict | None = None) -> str:
         self.git.ensure_repo()
@@ -147,15 +144,19 @@ class Orchestrator:
         escape_used = int((resume or {}).get("escape_used", 0))
         saved_plan = (resume or {}).get("plan")
         plan = DevPlan.model_validate(saved_plan) if isinstance(saved_plan, dict) else None
+        preflight = "" if resume else self._run_preflight()
 
         while True:
             if phase != "review":
-                project = self._select_context(worker_task, latest_failure)
+                project = self._select_context(worker_task, latest_failure + "\n" + preflight)
                 prompt = f"""USER TASK AND WORK PLAN:
 {worker_task}
 
 RELEVANT PROJECT CONTEXT:
 {project}
+
+CURRENT PROJECT VALIDATION BEFORE CHANGES:
+{preflight or "(not available)"}
 
 LATEST FAILURE:
 {latest_failure or "(none)"}
@@ -167,7 +168,6 @@ LATEST FAILURE:
                     self._save_resume(task, "fixing" if latest_failure else "implementation", latest_failure, evidence, None, repeated, last_sig, escape_used)
                     return self._pause_message(plan)
                 self.state.add("plan", plan.model_dump())
-
                 logs, command_codes = self._apply_plan(plan)
                 evidence = "\n\n".join(logs)
                 failed_logs = [x for x in logs if "\nexit=" in x and "\nexit=0\n" not in x]
@@ -187,12 +187,10 @@ LATEST FAILURE:
                         return "STOPPED: STUCK_DETECTED\n" + latest_failure
                     phase = "fixing"
                     continue
-
                 if not plan.done:
                     latest_failure = "CONTINUE_IMPLEMENTATION: Previous plan completed without command failure but task is not done."
                     phase = "fixing"
                     continue
-
                 if self._deterministic_review_ok(plan, command_codes):
                     print("Review: deterministic | result: approved")
                     self.state.add("review", {"approved": True, "backend": "deterministic", "command_codes": command_codes})
@@ -203,18 +201,9 @@ LATEST FAILURE:
                 phase = "implementation"
                 latest_failure = "RESUME_RECOVERY: Review snapshot did not contain its plan; verify current project state and finish the task."
                 continue
-
             print("Review: Gemini required")
             review_context = self._select_context(worker_task)
-            review_prompt = f"""TASK:
-{worker_task}
-
-RELEVANT PROJECT CONTEXT:
-{review_context}
-
-LATEST EXECUTION EVIDENCE:
-{evidence or "(no commands were run)"}
-"""
+            review_prompt = f"TASK:\n{worker_task}\n\nRELEVANT PROJECT CONTEXT:\n{review_context}\n\nLATEST EXECUTION EVIDENCE:\n{evidence or '(no commands were run)'}"
             review = self._gemini_call(REVIEW_SYSTEM, review_prompt, ReviewResult, "final review")
             if isinstance(review, str):
                 self._save_resume(task, "review", latest_failure, evidence, plan, repeated, last_sig, escape_used)
