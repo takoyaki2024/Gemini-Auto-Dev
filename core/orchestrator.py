@@ -2,8 +2,9 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 
+from core.ai_router import AIRouter
 from core.context_builder import ContextBuilder
-from core.gemini_client import GeminiClient, GeminiQuotaPaused, GeminiTemporaryUnavailable
+from core.gemini_client import GeminiQuotaPaused, GeminiTemporaryUnavailable
 from core.models import DevPlan, ReviewResult
 from core.state_store import StateStore
 from tools.security_gate import SecurityGate
@@ -31,7 +32,7 @@ class Orchestrator:
     def __init__(self, workspace: Path, config: dict):
         self.workspace = workspace.resolve()
         self.config = config
-        self.client = GeminiClient(config.get("model", "gemini-3.7-flash"))
+        self.ai = AIRouter(config)
         self.context = ContextBuilder(self.workspace)
         self.gate = SecurityGate(self.workspace)
         self.files = FileManager(self.workspace, self.gate)
@@ -49,9 +50,12 @@ class Orchestrator:
         normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
         return hashlib.sha256(normalized[-12000:].encode("utf-8", "ignore")).hexdigest()
 
-    def _call_structured(self, system: str, prompt: str, schema):
+    def _call_structured(self, system: str, prompt: str, schema, prefer_local: bool = True):
         try:
-            return self.client.structured(system, prompt, schema)
+            result, backend = self.ai.structured(system, prompt, schema, prefer_local=prefer_local)
+            self.state.add("ai_call", {"backend": backend, "schema": schema.__name__})
+            print(f"AI backend: {backend}")
+            return result
         except GeminiQuotaPaused as exc:
             self.state.add("paused", {"reason": "QUOTA_PAUSED", "error": str(exc)})
             return "QUOTA_PAUSED"
@@ -82,6 +86,7 @@ class Orchestrator:
         repeated = 0
         last_sig = ""
         escape_used = 0
+        force_gemini_next = False
 
         while True:
             project = self.context.build()
@@ -95,7 +100,8 @@ LATEST FAILURE:
 {latest_failure or "(none)"}
 """
             system = FIXER_SYSTEM if latest_failure else MANAGER_SYSTEM
-            plan = self._call_structured(system, prompt, DevPlan)
+            plan = self._call_structured(system, prompt, DevPlan, prefer_local=not force_gemini_next)
+            force_gemini_next = False
             if plan == "QUOTA_PAUSED":
                 return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
             if plan == "TEMPORARILY_UNAVAILABLE":
@@ -116,10 +122,11 @@ LATEST FAILURE:
                     if escape_used < self.escape_attempts:
                         escape_used += 1
                         latest_failure += (
-                            "\n\nSTUCK WARNING: Previous fixes repeated the same failure. "
-                            "Abandon the prior approach and use a materially different solution."
+                            "\n\nSTUCK WARNING: Local-first fixes repeated the same failure. "
+                            "Escalate to Gemini and abandon the prior approach for a materially different solution."
                         )
                         repeated = 0
+                        force_gemini_next = True
                         continue
                     self.state.add("stopped", {"reason": "STUCK_DETECTED", "failure": latest_failure})
                     return "STOPPED: STUCK_DETECTED\n" + latest_failure
@@ -134,7 +141,7 @@ PROJECT:
 LATEST EXECUTION EVIDENCE:
 {evidence or "(no commands were run)"}
 """
-            review = self._call_structured(REVIEW_SYSTEM, review_prompt, ReviewResult)
+            review = self._call_structured(REVIEW_SYSTEM, review_prompt, ReviewResult, prefer_local=True)
             if review == "QUOTA_PAUSED":
                 return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
             if review == "TEMPORARILY_UNAVAILABLE":
