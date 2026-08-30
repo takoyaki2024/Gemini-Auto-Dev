@@ -16,6 +16,11 @@ manager:
   backend: deterministic
   gemini_only_for_large_tasks: false
 
+review:
+  deterministic_first: true
+  require_command_evidence: true
+  max_actions_without_gemini: 6
+
 local_ai:
   enabled: false
   endpoint: http://127.0.0.1:11434
