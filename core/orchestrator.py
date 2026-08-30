@@ -3,7 +3,7 @@ from pathlib import Path
 import hashlib
 
 from core.context_builder import ContextBuilder
-from core.gemini_client import GeminiClient
+from core.gemini_client import GeminiClient, GeminiQuotaPaused, GeminiTemporaryUnavailable
 from core.models import DevPlan, ReviewResult
 from core.state_store import StateStore
 from tools.security_gate import SecurityGate
@@ -49,6 +49,16 @@ class Orchestrator:
         normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
         return hashlib.sha256(normalized[-12000:].encode("utf-8", "ignore")).hexdigest()
 
+    def _call_structured(self, system: str, prompt: str, schema):
+        try:
+            return self.client.structured(system, prompt, schema)
+        except GeminiQuotaPaused as exc:
+            self.state.add("paused", {"reason": "QUOTA_PAUSED", "error": str(exc)})
+            return "QUOTA_PAUSED"
+        except GeminiTemporaryUnavailable as exc:
+            self.state.add("paused", {"reason": "TEMPORARILY_UNAVAILABLE", "error": str(exc)})
+            return "TEMPORARILY_UNAVAILABLE"
+
     def _apply_plan(self, plan: DevPlan) -> list[str]:
         logs: list[str] = []
         for action in plan.actions:
@@ -85,7 +95,11 @@ LATEST FAILURE:
 {latest_failure or "(none)"}
 """
             system = FIXER_SYSTEM if latest_failure else MANAGER_SYSTEM
-            plan = self.client.structured(system, prompt, DevPlan)
+            plan = self._call_structured(system, prompt, DevPlan)
+            if plan == "QUOTA_PAUSED":
+                return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
+            if plan == "TEMPORARILY_UNAVAILABLE":
+                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after automatic retries. State was saved; retry later."
             self.state.add("plan", plan.model_dump())
 
             logs = self._apply_plan(plan)
@@ -120,7 +134,11 @@ PROJECT:
 LATEST EXECUTION EVIDENCE:
 {evidence or "(no commands were run)"}
 """
-            review = self.client.structured(REVIEW_SYSTEM, review_prompt, ReviewResult)
+            review = self._call_structured(REVIEW_SYSTEM, review_prompt, ReviewResult)
+            if review == "QUOTA_PAUSED":
+                return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
+            if review == "TEMPORARILY_UNAVAILABLE":
+                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after automatic retries. State was saved; retry later."
             self.state.add("review", review.model_dump())
 
             if review.approved and plan.done:
