@@ -1,9 +1,15 @@
 from __future__ import annotations
 from pathlib import Path
+import re
 
 SECRET_NAMES = {".env", "id_rsa", "id_ed25519", "credentials.json"}
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "Library", "Temp", "obj", "bin"}
 SECRET_SUFFIXES = {".key", ".pem", ".pfx"}
+IMPORTANT_NAMES = {
+    "readme.md", "pyproject.toml", "requirements.txt", "package.json", "package-lock.json",
+    "pytest.ini", "setup.cfg", "setup.py", "cargo.toml", "go.mod", "pom.xml",
+}
+CODE_SUFFIXES = {".py", ".cs", ".js", ".ts", ".tsx", ".jsx", ".java", ".cpp", ".c", ".h", ".go", ".rs", ".json", ".yaml", ".yml"}
 
 
 class ContextBuilder:
@@ -29,11 +35,8 @@ class ContextBuilder:
 
     def _iter_safe_files(self):
         for path in self.workspace.rglob("*"):
-            if not path.is_file():
-                continue
-            if not self._is_safe_path(path):
-                continue
-            yield path
+            if path.is_file() and self._is_safe_path(path):
+                yield path
 
     def manifest(self, max_files: int = 500) -> str:
         rows: list[str] = []
@@ -49,23 +52,52 @@ class ContextBuilder:
             rows.append(f"{rel} | {size} bytes")
         return "\n".join(rows)
 
+    @staticmethod
+    def _keywords(text: str) -> set[str]:
+        words = re.findall(r"[A-Za-z0-9_]{3,}|[\u3040-\u30ff\u3400-\u9fff]{2,}", text.lower())
+        stop = {"this", "that", "with", "from", "project", "code", "test", "tests", "file", "files", "してください", "プロジェクト", "コード", "必要", "確認"}
+        return {word for word in words if word not in stop}
+
+    def select_relevant(self, task: str, latest_failure: str = "", max_files: int = 12) -> list[str]:
+        keywords = self._keywords(task + "\n" + latest_failure)
+        scored: list[tuple[int, float, str]] = []
+        for path in self._iter_safe_files():
+            try:
+                rel = path.relative_to(self.workspace).as_posix()
+                stat = path.stat()
+            except Exception:
+                continue
+            low = rel.lower()
+            score = 0
+            if path.name.lower() in IMPORTANT_NAMES:
+                score += 8
+            if path.suffix.lower() in CODE_SUFFIXES:
+                score += 3
+            if "test" in low:
+                score += 2
+            for keyword in keywords:
+                if keyword in low:
+                    score += 10
+            scored.append((score, stat.st_mtime, rel))
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected = [rel for _, _, rel in scored[:max_files]]
+        return selected
+
     def build_selected(self, relative_paths: list[str], max_chars: int | None = None) -> str:
         limit = self.max_chars if max_chars is None else max_chars
         chunks: list[str] = []
         total = 0
         seen: set[Path] = set()
-
         for raw in relative_paths:
             try:
                 path = (self.workspace / raw).resolve()
                 path.relative_to(self.workspace)
             except Exception:
                 continue
-            if path in seen or not path.is_file():
+            if path in seen or not path.is_file() or not self._is_safe_path(path):
                 continue
             seen.add(path)
-            if not self._is_safe_path(path):
-                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except Exception:
@@ -76,8 +108,14 @@ class ContextBuilder:
                 break
             chunks.append(block)
             total += len(block)
-
         return "".join(chunks)
+
+    def build_relevant(self, task: str, latest_failure: str = "", max_files: int = 12) -> tuple[str, list[str]]:
+        selected = self.select_relevant(task, latest_failure, max_files)
+        context = self.build_selected(selected)
+        if context:
+            return context, selected
+        return self.build(), selected
 
     def build(self) -> str:
         files = [str(path.relative_to(self.workspace)) for path in self._iter_safe_files()]
