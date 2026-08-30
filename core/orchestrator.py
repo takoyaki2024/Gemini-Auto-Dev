@@ -7,6 +7,7 @@ from core.context_builder import ContextBuilder
 from core.gemini_client import GeminiQuotaPaused, GeminiTemporaryUnavailable
 from core.models import DevPlan, ReviewResult
 from core.state_store import StateStore
+from core.task_manager import DeterministicTaskManager
 from tools.security_gate import SecurityGate
 from tools.file_manager import FileManager
 from tools.command_runner import CommandRunner
@@ -35,6 +36,7 @@ class Orchestrator:
         self.workspace = workspace.resolve()
         self.config = config
         self.ai = AIRouter(config)
+        self.manager = DeterministicTaskManager()
         self.context = ContextBuilder(self.workspace, int(config.get("context", {}).get("max_chars", 80_000)))
         self.gate = SecurityGate(self.workspace)
         self.files = FileManager(self.workspace, self.gate)
@@ -94,15 +96,18 @@ class Orchestrator:
         self.git.ensure_repo()
         self.git.checkpoint("checkpoint: before autonomous task")
         self.state.add("task", {"task": task})
+        worker_task, managed = self.manager.worker_instruction(task)
+        self.state.add("manager_plan", {"backend": "deterministic", "items": [item.__dict__ for item in managed]})
+        print(f"Manager: deterministic | steps: {len(managed)}")
         latest_failure = ""
         repeated = 0
         last_sig = ""
         escape_used = 0
 
         while True:
-            project = self._select_context(task, latest_failure)
-            prompt = f"""USER TASK:
-{task}
+            project = self._select_context(worker_task, latest_failure)
+            prompt = f"""USER TASK AND WORK PLAN:
+{worker_task}
 
 RELEVANT PROJECT CONTEXT:
 {project}
@@ -139,9 +144,9 @@ LATEST FAILURE:
                 latest_failure = "CONTINUE_IMPLEMENTATION: Previous plan completed without command failure but task is not done."
                 continue
 
-            review_context = self._select_context(task)
+            review_context = self._select_context(worker_task)
             review_prompt = f"""TASK:
-{task}
+{worker_task}
 
 RELEVANT PROJECT CONTEXT:
 {review_context}
