@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 if (-not (Test-Path '.venv\Scripts\python.exe')) {
-    throw '先に .\setup.ps1 を実行してください。'
+    throw 'Run .\setup.ps1 first.'
 }
 
 if (-not $env:GEMINI_API_KEY) {
@@ -16,7 +16,7 @@ if (-not $env:GEMINI_API_KEY) {
 }
 
 if (-not $env:GEMINI_API_KEY) {
-    throw 'GEMINI_API_KEY が設定されていません。先に .\setup.ps1 を実行してください。'
+    throw 'GEMINI_API_KEY is not configured. Run .\setup.ps1 first.'
 }
 
 if ($Task) {
