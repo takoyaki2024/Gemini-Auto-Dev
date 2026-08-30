@@ -11,13 +11,27 @@ class ContextBuilder:
         self.workspace = workspace.resolve()
         self.max_chars = max_chars
 
+    def _relative_parts(self, path: Path) -> tuple[str, ...]:
+        try:
+            return path.relative_to(self.workspace).parts
+        except ValueError:
+            return ()
+
+    def _is_safe_path(self, path: Path) -> bool:
+        relative_parts = self._relative_parts(path)
+        if not relative_parts:
+            return False
+        if any(part in SKIP_DIRS for part in relative_parts[:-1]):
+            return False
+        if path.name in SECRET_NAMES or path.suffix.lower() in SECRET_SUFFIXES:
+            return False
+        return True
+
     def _iter_safe_files(self):
         for path in self.workspace.rglob("*"):
             if not path.is_file():
                 continue
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if path.name in SECRET_NAMES or path.suffix.lower() in SECRET_SUFFIXES:
+            if not self._is_safe_path(path):
                 continue
             yield path
 
@@ -50,9 +64,7 @@ class ContextBuilder:
             if path in seen or not path.is_file():
                 continue
             seen.add(path)
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if path.name in SECRET_NAMES or path.suffix.lower() in SECRET_SUFFIXES:
+            if not self._is_safe_path(path):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
