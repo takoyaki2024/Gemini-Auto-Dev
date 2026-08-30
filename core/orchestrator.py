@@ -5,7 +5,7 @@ import hashlib
 from core.ai_router import AIRouter
 from core.context_builder import ContextBuilder
 from core.gemini_client import GeminiQuotaPaused, GeminiTemporaryUnavailable
-from core.models import DevPlan, RelevantFiles, ReviewResult
+from core.models import DevPlan, ReviewResult
 from core.state_store import StateStore
 from tools.security_gate import SecurityGate
 from tools.file_manager import FileManager
@@ -29,31 +29,22 @@ REVIEW_SYSTEM = """You are the final reviewer.
 Approve only when the requested task is implemented and available execution evidence shows no major problem.
 If not approved, give one concrete next_instruction."""
 
-LOCAL_SELECTOR_SYSTEM = """You are a fast local helper. Do not solve or code the task.
-Select only the project files most relevant to the user task or latest failure.
-Return file paths exactly as they appear in the manifest.
-Keep the selection small; normally 3 to 12 files."""
-
 
 class Orchestrator:
     def __init__(self, workspace: Path, config: dict):
         self.workspace = workspace.resolve()
         self.config = config
         self.ai = AIRouter(config)
-        self.context = ContextBuilder(
-            self.workspace,
-            int(config.get("context", {}).get("max_chars", 80_000)),
-        )
+        self.context = ContextBuilder(self.workspace, int(config.get("context", {}).get("max_chars", 80_000)))
         self.gate = SecurityGate(self.workspace)
         self.files = FileManager(self.workspace, self.gate)
-        self.runner = CommandRunner(
-            self.workspace, self.gate, int(config.get("command_timeout_seconds", 300))
-        )
+        self.runner = CommandRunner(self.workspace, self.gate, int(config.get("command_timeout_seconds", 300)))
         self.git = GitManager(self.workspace)
         self.state = StateStore(self.workspace)
         stuck = config.get("stuck", {})
         self.identical_limit = int(stuck.get("identical_error_limit", 3))
         self.escape_attempts = int(stuck.get("escape_attempts", 1))
+        self.max_context_files = int(config.get("context", {}).get("max_files", 12))
 
     @staticmethod
     def _sig(text: str) -> str:
@@ -74,29 +65,10 @@ class Orchestrator:
             return "TEMPORARILY_UNAVAILABLE"
 
     def _select_context(self, task: str, latest_failure: str = "") -> str:
-        manifest = self.context.manifest()
-        local_cfg = self.config.get("local_ai", {})
-        max_selected = int(local_cfg.get("max_selected_files", 12))
-        prompt = f"""USER TASK:
-{task}
-
-LATEST FAILURE:
-{latest_failure or "(none)"}
-
-FILE MANIFEST:
-{manifest}
-"""
-        selected = self.ai.local_structured(LOCAL_SELECTOR_SYSTEM, prompt, RelevantFiles)
-        if selected is not None:
-            files = selected.files[:max_selected]
-            compact = self.context.build_selected(files)
-            if compact:
-                print(f"AI backend: local | reason: context selection | files: {len(files)}")
-                self.state.add("ai_call", {"backend": "local", "schema": "RelevantFiles", "reason": "context_selection", "files": files})
-                return compact
-
-        print("Local context selection unavailable; using bounded project context without Gemini.")
-        return self.context.build()
+        project, files = self.context.build_relevant(task, latest_failure, self.max_context_files)
+        print(f"Context selector: deterministic | files: {len(files)}")
+        self.state.add("context_selection", {"backend": "deterministic", "files": files})
+        return project
 
     def _apply_plan(self, plan: DevPlan) -> list[str]:
         logs: list[str] = []
@@ -122,7 +94,6 @@ FILE MANIFEST:
         self.git.ensure_repo()
         self.git.checkpoint("checkpoint: before autonomous task")
         self.state.add("task", {"task": task})
-
         latest_failure = ""
         repeated = 0
         last_sig = ""
@@ -149,20 +120,15 @@ LATEST FAILURE:
             logs = self._apply_plan(plan)
             evidence = "\n\n".join(logs)
             failed_logs = [x for x in logs if "\nexit=" in x and "\nexit=0\n" not in x]
-
             if failed_logs:
                 latest_failure = failed_logs[-1][-20000:]
                 sig = self._sig(latest_failure)
                 repeated = repeated + 1 if sig == last_sig else 1
                 last_sig = sig
-
                 if repeated >= self.identical_limit:
                     if escape_used < self.escape_attempts:
                         escape_used += 1
-                        latest_failure += (
-                            "\n\nSTUCK WARNING: The same failure repeated. "
-                            "Abandon the prior approach and choose a materially different solution."
-                        )
+                        latest_failure += "\n\nSTUCK WARNING: The same failure repeated. Abandon the prior approach and choose a materially different solution."
                         repeated = 0
                         continue
                     self.state.add("stopped", {"reason": "STUCK_DETECTED", "failure": latest_failure})
@@ -187,13 +153,8 @@ LATEST EXECUTION EVIDENCE:
             if isinstance(review, str):
                 return self._pause_message(review)
             self.state.add("review", review.model_dump())
-
             if review.approved:
                 if self.config.get("auto_commit", True):
                     self.git.checkpoint(f"auto-dev: {task[:72]}")
                 return "COMPLETED: task implemented, reviewed, and checkpointed."
-
-            latest_failure = (
-                "REVIEW_NOT_APPROVED:\n"
-                + (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
-            )
+            latest_failure = "REVIEW_NOT_APPROVED:\n" + (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
