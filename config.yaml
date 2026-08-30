@@ -1,0 +1,13 @@
+model: gemini-3.7-flash
+workspace: ./workspace
+auto_install: true
+auto_commit: true
+allow_delete: true
+allow_network: true
+command_timeout_seconds: 300
+stuck:
+  identical_error_limit: 3
+  escape_attempts: 1
+security:
+  protect_outside_workspace: true
+  protect_secrets: true
