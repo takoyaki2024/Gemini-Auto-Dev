@@ -5,11 +5,15 @@ auto_commit: true
 allow_delete: true
 allow_network: true
 command_timeout_seconds: 300
+fast_mode: true
 local_ai:
   enabled: true
   endpoint: http://127.0.0.1:11434
-  model: "qwen3:4b"
+  model: qwen3:4b
   timeout_seconds: 180
+  max_calls_before_gemini: 2
+gemini:
+  max_retries: 2
 stuck:
   identical_error_limit: 3
   escape_attempts: 1
