@@ -8,7 +8,7 @@ command_timeout_seconds: 300
 local_ai:
   enabled: true
   endpoint: http://127.0.0.1:11434
-  model: ""
+  model: "qwen3:4b"
   timeout_seconds: 180
 stuck:
   identical_error_limit: 3
