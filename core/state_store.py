@@ -40,7 +40,31 @@ class StateStore:
             payload = row[3]
         return {"id": row[0], "ts": row[1], "kind": row[2], "payload": payload}
 
+    def save_resume(self, payload: dict) -> None:
+        self.add("resume_snapshot", payload)
+
+    def resumable_snapshot(self) -> dict | None:
+        snapshot = self.latest("resume_snapshot")
+        if not snapshot or not isinstance(snapshot["payload"], dict):
+            return None
+        with sqlite3.connect(self.db) as con:
+            row = con.execute(
+                "SELECT kind FROM events WHERE id>? AND kind IN ('completed','stopped','task') ORDER BY id DESC LIMIT 1",
+                (snapshot["id"],),
+            ).fetchone()
+        if row:
+            return None
+        payload = snapshot["payload"]
+        if not str(payload.get("task", "")).strip():
+            return None
+        return payload
+
     def resumable_task(self) -> str | None:
+        snapshot = self.resumable_snapshot()
+        if snapshot:
+            return str(snapshot.get("task", "")).strip() or None
+
+        # Compatibility with state databases created before resume snapshots existed.
         last_task = self.latest("task")
         if not last_task or not isinstance(last_task["payload"], dict):
             return None
@@ -52,7 +76,7 @@ class StateStore:
                 "SELECT kind FROM events WHERE id>? AND kind IN ('completed','stopped','task') ORDER BY id DESC LIMIT 1",
                 (last_task["id"],),
             ).fetchone()
-        if row and row[0] in {"completed", "stopped", "task"}:
+        if row:
             return None
         latest = self.latest()
         if latest and latest["kind"] == "paused":
