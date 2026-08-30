@@ -20,7 +20,7 @@ class GeminiQuotaPaused(RuntimeError):
 
 
 class GeminiClient:
-    def __init__(self, model: str, max_retries: int = 8):
+    def __init__(self, model: str, max_retries: int = 2):
         if not os.getenv("GEMINI_API_KEY"):
             raise RuntimeError("GEMINI_API_KEY is not configured.")
         self.model = model
@@ -37,7 +37,7 @@ class GeminiClient:
 
     @staticmethod
     def _retry_delay(attempt: int) -> int:
-        delays = (5, 10, 20, 40, 60, 60, 60)
+        delays = (5, 10)
         return delays[min(attempt - 1, len(delays) - 1)]
 
     def structured(self, system: str, prompt: str, schema: type[T]) -> T:
