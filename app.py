@@ -20,11 +20,18 @@ def main() -> int:
     workspace = Path(args.workspace or config.get("workspace", "./workspace")).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
+    state = StateStore(workspace)
     task = (args.task or "").strip()
+    resume = None
     if not task and not args.no_resume:
-        task = StateStore(workspace).resumable_task() or ""
-        if task:
-            print(f"RESUME: paused task restored: {task}")
+        resume = state.resumable_snapshot()
+        if resume:
+            task = str(resume.get("task", "")).strip()
+            print(f"RESUME: phase={resume.get('phase', 'implementation')} | task: {task}")
+        else:
+            task = state.resumable_task() or ""
+            if task:
+                print(f"RESUME: legacy paused task restored: {task}")
 
     if not task:
         task = input("開発依頼> ").strip()
@@ -33,7 +40,7 @@ def main() -> int:
         return 2
 
     orchestrator = Orchestrator(workspace=workspace, config=config)
-    result = orchestrator.run(task)
+    result = orchestrator.run(task, resume=resume)
     print(result)
     return 0 if result.startswith("COMPLETED") else 1
 
