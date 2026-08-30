@@ -12,7 +12,11 @@ T = TypeVar("T", bound=BaseModel)
 
 class AIRouter:
     def __init__(self, config: dict):
-        self.gemini = GeminiClient(config.get("model", "gemini-3.7-flash"))
+        gemini = config.get("gemini", {})
+        self.gemini = GeminiClient(
+            config.get("model", "gemini-3.7-flash"),
+            max_retries=int(gemini.get("max_retries", 2)),
+        )
         local = config.get("local_ai", {})
         self.local_enabled = bool(local.get("enabled", True))
         self.local = LocalAIClient(
