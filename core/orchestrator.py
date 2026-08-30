@@ -72,8 +72,9 @@ class Orchestrator:
         self.state.add("context_selection", {"backend": "deterministic", "files": files})
         return project
 
-    def _apply_plan(self, plan: DevPlan) -> list[str]:
+    def _apply_plan(self, plan: DevPlan) -> tuple[list[str], list[int]]:
         logs: list[str] = []
+        command_codes: list[int] = []
         for action in plan.actions:
             self.files.apply(action)
             logs.append(f"{action.type}: {action.path}")
@@ -81,10 +82,33 @@ class Orchestrator:
             result = self.runner.run(command)
             text = result.text()
             logs.append(text)
+            command_codes.append(result.code)
             self.state.add("command", {"command": command, "code": result.code, "output": text[-20000:]})
             if not result.ok:
                 break
-        return logs
+        return logs, command_codes
+
+    def _deterministic_review_ok(self, plan: DevPlan, command_codes: list[int]) -> bool:
+        review_cfg = self.config.get("review", {})
+        if not review_cfg.get("deterministic_first", True):
+            return False
+        if review_cfg.get("require_command_evidence", True) and not command_codes:
+            return False
+        if any(code != 0 for code in command_codes):
+            return False
+        max_actions = int(review_cfg.get("max_actions_without_gemini", 6))
+        if len(plan.actions) > max_actions:
+            return False
+        risky_suffixes = {".ps1", ".bat", ".cmd", ".sh", ".yml", ".yaml"}
+        if any(Path(action.path).suffix.lower() in risky_suffixes for action in plan.actions):
+            return False
+        return plan.done
+
+    def _complete(self, task: str, review_backend: str) -> str:
+        if self.config.get("auto_commit", True):
+            self.git.checkpoint(f"auto-dev: {task[:72]}")
+        self.state.add("completed", {"task": task, "review_backend": review_backend})
+        return f"COMPLETED: task implemented, validated, and checkpointed. review={review_backend}"
 
     @staticmethod
     def _pause_message(code: str) -> str:
@@ -122,7 +146,7 @@ LATEST FAILURE:
                 return self._pause_message(plan)
             self.state.add("plan", plan.model_dump())
 
-            logs = self._apply_plan(plan)
+            logs, command_codes = self._apply_plan(plan)
             evidence = "\n\n".join(logs)
             failed_logs = [x for x in logs if "\nexit=" in x and "\nexit=0\n" not in x]
             if failed_logs:
@@ -144,6 +168,12 @@ LATEST FAILURE:
                 latest_failure = "CONTINUE_IMPLEMENTATION: Previous plan completed without command failure but task is not done."
                 continue
 
+            if self._deterministic_review_ok(plan, command_codes):
+                print("Review: deterministic | result: approved")
+                self.state.add("review", {"approved": True, "backend": "deterministic", "command_codes": command_codes})
+                return self._complete(task, "deterministic")
+
+            print("Review: Gemini required")
             review_context = self._select_context(worker_task)
             review_prompt = f"""TASK:
 {worker_task}
@@ -159,8 +189,5 @@ LATEST EXECUTION EVIDENCE:
                 return self._pause_message(review)
             self.state.add("review", review.model_dump())
             if review.approved:
-                if self.config.get("auto_commit", True):
-                    self.git.checkpoint(f"auto-dev: {task[:72]}")
-                self.state.add("completed", {"task": task})
-                return "COMPLETED: task implemented, reviewed, and checkpointed."
+                return self._complete(task, "gemini")
             latest_failure = "REVIEW_NOT_APPROVED:\n" + (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
