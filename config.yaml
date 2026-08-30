@@ -6,17 +6,36 @@ allow_delete: true
 allow_network: true
 command_timeout_seconds: 300
 fast_mode: true
+
+billing:
+  allowed: false
+  paid_fallback: false
+  auto_upgrade: false
+
 local_ai:
   enabled: true
   endpoint: http://127.0.0.1:11434
   model: qwen3:4b
-  timeout_seconds: 180
-  max_calls_before_gemini: 2
+  timeout_seconds: 90
+  role: context_selection_only
+  max_selected_files: 12
+
 gemini:
   max_retries: 2
+  free_only: true
+  paid_fallback: false
+  on_quota_exhausted: stop
+
+context:
+  max_chars: 80000
+
+workers:
+  max_parallel: 1
+
 stuck:
   identical_error_limit: 3
   escape_attempts: 1
+
 security:
   protect_outside_workspace: true
   protect_secrets: true
