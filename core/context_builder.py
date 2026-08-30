@@ -58,10 +58,61 @@ class ContextBuilder:
         stop = {"this", "that", "with", "from", "project", "code", "test", "tests", "file", "files", "してください", "プロジェクト", "コード", "必要", "確認"}
         return {word for word in words if word not in stop}
 
+    @staticmethod
+    def _stem_key(path: Path) -> str:
+        stem = path.stem.lower()
+        for prefix in ("test_", "tests_", "spec_"):
+            if stem.startswith(prefix):
+                stem = stem[len(prefix):]
+        for suffix in ("_test", "_tests", ".test", ".spec"):
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+        return stem
+
+    def _adjacent_files(self, selected: list[str], candidates: list[Path]) -> list[str]:
+        chosen = set(selected)
+        selected_paths = [(self.workspace / rel).resolve() for rel in selected]
+        selected_stems = {self._stem_key(path) for path in selected_paths}
+        selected_names = {path.stem.lower() for path in selected_paths}
+
+        for path in candidates:
+            rel = path.relative_to(self.workspace).as_posix()
+            if rel in chosen:
+                continue
+            low = rel.lower()
+            stem_key = self._stem_key(path)
+            # Pair source and test files with the same logical stem.
+            if stem_key and stem_key in selected_stems and ("test" in low or any("test" in x.lower() for x in selected)):
+                chosen.add(rel)
+                continue
+            # Cheap Python import adjacency: inspect only selected Python files.
+            if path.suffix.lower() == ".py" and path.stem.lower() in selected_names:
+                chosen.add(rel)
+
+        imported: set[str] = set()
+        for selected_path in selected_paths:
+            if selected_path.suffix.lower() != ".py":
+                continue
+            try:
+                text = selected_path.read_text(encoding="utf-8")[:20_000]
+            except Exception:
+                continue
+            for module in re.findall(r"(?:from|import)\s+([A-Za-z_][A-Za-z0-9_\.]*)", text):
+                imported.add(module.split(".")[-1].lower())
+        for path in candidates:
+            if path.suffix.lower() == ".py" and path.stem.lower() in imported:
+                chosen.add(path.relative_to(self.workspace).as_posix())
+        return list(chosen)
+
     def select_relevant(self, task: str, latest_failure: str = "", max_files: int = 12) -> list[str]:
+        candidates = list(self._iter_safe_files())
+        # Tiny projects are cheaper and more reliable when all safe files are supplied.
+        if len(candidates) <= max_files:
+            return [path.relative_to(self.workspace).as_posix() for path in candidates]
+
         keywords = self._keywords(task + "\n" + latest_failure)
         scored: list[tuple[int, float, str]] = []
-        for path in self._iter_safe_files():
+        for path in candidates:
             try:
                 rel = path.relative_to(self.workspace).as_posix()
                 stat = path.stat()
@@ -81,8 +132,11 @@ class ContextBuilder:
             scored.append((score, stat.st_mtime, rel))
 
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        selected = [rel for _, _, rel in scored[:max_files]]
-        return selected
+        seed_count = max(1, max_files // 2)
+        selected = [rel for _, _, rel in scored[:seed_count]]
+        adjacent = self._adjacent_files(selected, candidates)
+        priority = selected + [rel for rel in adjacent if rel not in selected] + [rel for _, _, rel in scored if rel not in selected]
+        return priority[:max_files]
 
     def build_selected(self, relative_paths: list[str], max_chars: int | None = None) -> str:
         limit = self.max_chars if max_chars is None else max_chars
@@ -105,7 +159,7 @@ class ContextBuilder:
             rel = path.relative_to(self.workspace)
             block = f"\n--- FILE: {rel} ---\n{text}\n"
             if total + len(block) > limit:
-                break
+                continue
             chunks.append(block)
             total += len(block)
         return "".join(chunks)
