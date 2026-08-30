@@ -66,6 +66,18 @@ class Orchestrator:
             self.state.add("paused", {"reason": "TEMPORARILY_UNAVAILABLE", "error": str(exc)})
             return "TEMPORARILY_UNAVAILABLE"
 
+    def _save_resume(self, task: str, phase: str, latest_failure: str = "", evidence: str = "", plan: DevPlan | None = None, repeated: int = 0, last_sig: str = "", escape_used: int = 0) -> None:
+        self.state.save_resume({
+            "task": task,
+            "phase": phase,
+            "latest_failure": latest_failure,
+            "evidence": evidence[-30000:],
+            "plan": plan.model_dump() if plan else None,
+            "repeated": repeated,
+            "last_sig": last_sig,
+            "escape_used": escape_used,
+        })
+
     def _select_context(self, task: str, latest_failure: str = "") -> str:
         project, files = self.context.build_relevant(task, latest_failure, self.max_context_files)
         print(f"Context selector: deterministic | files: {len(files)}")
@@ -113,24 +125,33 @@ class Orchestrator:
     @staticmethod
     def _pause_message(code: str) -> str:
         if code == "QUOTA_PAUSED":
-            return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; development stopped."
-        return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after fast retries. State was saved; retry later."
+            return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. Resume snapshot was saved; development stopped."
+        return "PAUSED: TEMPORARILY_UNAVAILABLE. Resume snapshot was saved; retry later."
 
-    def run(self, task: str) -> str:
+    def run(self, task: str, resume: dict | None = None) -> str:
         self.git.ensure_repo()
-        self.git.checkpoint("checkpoint: before autonomous task")
-        self.state.add("task", {"task": task})
         worker_task, managed = self.manager.worker_instruction(task)
-        self.state.add("manager_plan", {"backend": "deterministic", "items": [item.__dict__ for item in managed]})
+        if resume:
+            print(f"True Resume: phase={resume.get('phase', 'implementation')}")
+        else:
+            self.git.checkpoint("checkpoint: before autonomous task")
+            self.state.add("task", {"task": task})
+            self.state.add("manager_plan", {"backend": "deterministic", "items": [item.__dict__ for item in managed]})
         print(f"Manager: deterministic | steps: {len(managed)}")
-        latest_failure = ""
-        repeated = 0
-        last_sig = ""
-        escape_used = 0
+
+        phase = str((resume or {}).get("phase", "implementation"))
+        latest_failure = str((resume or {}).get("latest_failure", ""))
+        evidence = str((resume or {}).get("evidence", ""))
+        repeated = int((resume or {}).get("repeated", 0))
+        last_sig = str((resume or {}).get("last_sig", ""))
+        escape_used = int((resume or {}).get("escape_used", 0))
+        saved_plan = (resume or {}).get("plan")
+        plan = DevPlan.model_validate(saved_plan) if isinstance(saved_plan, dict) else None
 
         while True:
-            project = self._select_context(worker_task, latest_failure)
-            prompt = f"""USER TASK AND WORK PLAN:
+            if phase != "review":
+                project = self._select_context(worker_task, latest_failure)
+                prompt = f"""USER TASK AND WORK PLAN:
 {worker_task}
 
 RELEVANT PROJECT CONTEXT:
@@ -139,39 +160,49 @@ RELEVANT PROJECT CONTEXT:
 LATEST FAILURE:
 {latest_failure or "(none)"}
 """
-            system = FIXER_SYSTEM if latest_failure else MANAGER_SYSTEM
-            reason = "fixing failure" if latest_failure else "implementation"
-            plan = self._gemini_call(system, prompt, DevPlan, reason)
-            if isinstance(plan, str):
-                return self._pause_message(plan)
-            self.state.add("plan", plan.model_dump())
+                system = FIXER_SYSTEM if latest_failure else MANAGER_SYSTEM
+                reason = "fixing failure" if latest_failure else "implementation"
+                plan = self._gemini_call(system, prompt, DevPlan, reason)
+                if isinstance(plan, str):
+                    self._save_resume(task, "fixing" if latest_failure else "implementation", latest_failure, evidence, None, repeated, last_sig, escape_used)
+                    return self._pause_message(plan)
+                self.state.add("plan", plan.model_dump())
 
-            logs, command_codes = self._apply_plan(plan)
-            evidence = "\n\n".join(logs)
-            failed_logs = [x for x in logs if "\nexit=" in x and "\nexit=0\n" not in x]
-            if failed_logs:
-                latest_failure = failed_logs[-1][-20000:]
-                sig = self._sig(latest_failure)
-                repeated = repeated + 1 if sig == last_sig else 1
-                last_sig = sig
-                if repeated >= self.identical_limit:
-                    if escape_used < self.escape_attempts:
-                        escape_used += 1
-                        latest_failure += "\n\nSTUCK WARNING: The same failure repeated. Abandon the prior approach and choose a materially different solution."
-                        repeated = 0
-                        continue
-                    self.state.add("stopped", {"reason": "STUCK_DETECTED", "failure": latest_failure})
-                    return "STOPPED: STUCK_DETECTED\n" + latest_failure
+                logs, command_codes = self._apply_plan(plan)
+                evidence = "\n\n".join(logs)
+                failed_logs = [x for x in logs if "\nexit=" in x and "\nexit=0\n" not in x]
+                if failed_logs:
+                    latest_failure = failed_logs[-1][-20000:]
+                    sig = self._sig(latest_failure)
+                    repeated = repeated + 1 if sig == last_sig else 1
+                    last_sig = sig
+                    if repeated >= self.identical_limit:
+                        if escape_used < self.escape_attempts:
+                            escape_used += 1
+                            latest_failure += "\n\nSTUCK WARNING: The same failure repeated. Abandon the prior approach and choose a materially different solution."
+                            repeated = 0
+                            phase = "fixing"
+                            continue
+                        self.state.add("stopped", {"reason": "STUCK_DETECTED", "failure": latest_failure})
+                        return "STOPPED: STUCK_DETECTED\n" + latest_failure
+                    phase = "fixing"
+                    continue
+
+                if not plan.done:
+                    latest_failure = "CONTINUE_IMPLEMENTATION: Previous plan completed without command failure but task is not done."
+                    phase = "fixing"
+                    continue
+
+                if self._deterministic_review_ok(plan, command_codes):
+                    print("Review: deterministic | result: approved")
+                    self.state.add("review", {"approved": True, "backend": "deterministic", "command_codes": command_codes})
+                    return self._complete(task, "deterministic")
+                phase = "review"
+
+            if plan is None:
+                phase = "implementation"
+                latest_failure = "RESUME_RECOVERY: Review snapshot did not contain its plan; verify current project state and finish the task."
                 continue
-
-            if not plan.done:
-                latest_failure = "CONTINUE_IMPLEMENTATION: Previous plan completed without command failure but task is not done."
-                continue
-
-            if self._deterministic_review_ok(plan, command_codes):
-                print("Review: deterministic | result: approved")
-                self.state.add("review", {"approved": True, "backend": "deterministic", "command_codes": command_codes})
-                return self._complete(task, "deterministic")
 
             print("Review: Gemini required")
             review_context = self._select_context(worker_task)
@@ -186,8 +217,10 @@ LATEST EXECUTION EVIDENCE:
 """
             review = self._gemini_call(REVIEW_SYSTEM, review_prompt, ReviewResult, "final review")
             if isinstance(review, str):
+                self._save_resume(task, "review", latest_failure, evidence, plan, repeated, last_sig, escape_used)
                 return self._pause_message(review)
             self.state.add("review", review.model_dump())
             if review.approved:
                 return self._complete(task, "gemini")
             latest_failure = "REVIEW_NOT_APPROVED:\n" + (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
+            phase = "fixing"
