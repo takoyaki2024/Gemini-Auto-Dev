@@ -16,6 +16,9 @@ manager:
   backend: deterministic
   gemini_only_for_large_tasks: false
 
+preflight:
+  enabled: true
+
 review:
   deterministic_first: true
   require_command_evidence: true
