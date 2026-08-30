@@ -5,6 +5,11 @@ auto_commit: true
 allow_delete: true
 allow_network: true
 command_timeout_seconds: 300
+local_ai:
+  enabled: true
+  endpoint: http://127.0.0.1:11434
+  model: ""
+  timeout_seconds: 180
 stuck:
   identical_error_limit: 3
   escape_attempts: 1
