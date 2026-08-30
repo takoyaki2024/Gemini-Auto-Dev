@@ -5,35 +5,45 @@ import hashlib
 from core.ai_router import AIRouter
 from core.context_builder import ContextBuilder
 from core.gemini_client import GeminiQuotaPaused, GeminiTemporaryUnavailable
-from core.models import DevPlan, ReviewResult
+from core.models import DevPlan, RelevantFiles, ReviewResult
 from core.state_store import StateStore
 from tools.security_gate import SecurityGate
 from tools.file_manager import FileManager
 from tools.command_runner import CommandRunner
 from tools.git_manager import GitManager
 
-MANAGER_SYSTEM = """You are the sole coding agent in an autonomous development system.
+MANAGER_SYSTEM = """You are the coding worker in an autonomous development system.
+Implement the requested task using only the supplied project context.
 Return only actions inside the requested workspace.
 Prefer small, testable changes. Never request secrets.
-Use commands needed to build/test/install dependencies.
-Do not change OS-wide settings unless absolutely required.
+Use commands needed to build/test/install project dependencies.
+Do not change OS-wide settings.
 When the task is fully complete, set done=true."""
 
 FIXER_SYSTEM = """You are fixing a failed autonomous software-development attempt.
-Analyze the current project and latest command output.
+Analyze the supplied relevant project files and latest failure.
 Choose a materially different fix if the same error is repeating.
-Return only safe workspace file actions and build/test/install commands."""
+Return only safe workspace file actions and build/test commands."""
 
 REVIEW_SYSTEM = """You are the final reviewer.
-Approve only when the requested task is implemented and available evidence shows no major problem.
+Approve only when the requested task is implemented and available execution evidence shows no major problem.
 If not approved, give one concrete next_instruction."""
+
+LOCAL_SELECTOR_SYSTEM = """You are a fast local helper. Do not solve or code the task.
+Select only the project files most relevant to the user task or latest failure.
+Return file paths exactly as they appear in the manifest.
+Keep the selection small; normally 3 to 12 files."""
+
 
 class Orchestrator:
     def __init__(self, workspace: Path, config: dict):
         self.workspace = workspace.resolve()
         self.config = config
         self.ai = AIRouter(config)
-        self.context = ContextBuilder(self.workspace)
+        self.context = ContextBuilder(
+            self.workspace,
+            int(config.get("context", {}).get("max_chars", 80_000)),
+        )
         self.gate = SecurityGate(self.workspace)
         self.files = FileManager(self.workspace, self.gate)
         self.runner = CommandRunner(
@@ -44,41 +54,17 @@ class Orchestrator:
         stuck = config.get("stuck", {})
         self.identical_limit = int(stuck.get("identical_error_limit", 3))
         self.escape_attempts = int(stuck.get("escape_attempts", 1))
-        local = config.get("local_ai", {})
-        self.local_call_limit = max(0, int(local.get("max_calls_before_gemini", 2)))
-        self.local_calls = 0
 
     @staticmethod
     def _sig(text: str) -> str:
         normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
         return hashlib.sha256(normalized[-12000:].encode("utf-8", "ignore")).hexdigest()
 
-    def _call_structured(self, system: str, prompt: str, schema, prefer_local: bool = True, reason: str = ""):
-        local_budget_available = self.local_calls < self.local_call_limit
-        use_local = prefer_local and local_budget_available
-
-        if prefer_local and not local_budget_available:
-            message = f"Escalating to Gemini: local fast-mode budget exhausted ({self.local_calls}/{self.local_call_limit})"
-            if reason:
-                message += f"; reason={reason}"
-            print(message)
-            self.state.add("ai_escalation", {"reason": reason or "local_budget_exhausted", "local_calls": self.local_calls})
-        elif not prefer_local:
-            message = "Escalating to Gemini: local AI bypassed for this step"
-            if reason:
-                message += f"; reason={reason}"
-            print(message)
-            self.state.add("ai_escalation", {"reason": reason or "forced_gemini", "local_calls": self.local_calls})
-
+    def _gemini_call(self, system: str, prompt: str, schema, reason: str):
+        print(f"AI backend: gemini | reason: {reason}")
         try:
-            result, backend = self.ai.structured(system, prompt, schema, prefer_local=use_local)
-            if backend == "local":
-                self.local_calls += 1
-            self.state.add(
-                "ai_call",
-                {"backend": backend, "schema": schema.__name__, "reason": reason, "local_calls": self.local_calls},
-            )
-            print(f"AI backend: {backend} | reason: {reason or 'normal'}")
+            result = self.ai.gemini_structured(system, prompt, schema)
+            self.state.add("ai_call", {"backend": "gemini", "schema": schema.__name__, "reason": reason})
             return result
         except GeminiQuotaPaused as exc:
             self.state.add("paused", {"reason": "QUOTA_PAUSED", "error": str(exc)})
@@ -86,6 +72,31 @@ class Orchestrator:
         except GeminiTemporaryUnavailable as exc:
             self.state.add("paused", {"reason": "TEMPORARILY_UNAVAILABLE", "error": str(exc)})
             return "TEMPORARILY_UNAVAILABLE"
+
+    def _select_context(self, task: str, latest_failure: str = "") -> str:
+        manifest = self.context.manifest()
+        local_cfg = self.config.get("local_ai", {})
+        max_selected = int(local_cfg.get("max_selected_files", 12))
+        prompt = f"""USER TASK:
+{task}
+
+LATEST FAILURE:
+{latest_failure or "(none)"}
+
+FILE MANIFEST:
+{manifest}
+"""
+        selected = self.ai.local_structured(LOCAL_SELECTOR_SYSTEM, prompt, RelevantFiles)
+        if selected is not None:
+            files = selected.files[:max_selected]
+            compact = self.context.build_selected(files)
+            if compact:
+                print(f"AI backend: local | reason: context selection | files: {len(files)}")
+                self.state.add("ai_call", {"backend": "local", "schema": "RelevantFiles", "reason": "context_selection", "files": files})
+                return compact
+
+        print("Local context selection unavailable; using bounded project context without Gemini.")
+        return self.context.build()
 
     def _apply_plan(self, plan: DevPlan) -> list[str]:
         logs: list[str] = []
@@ -101,6 +112,12 @@ class Orchestrator:
                 break
         return logs
 
+    @staticmethod
+    def _pause_message(code: str) -> str:
+        if code == "QUOTA_PAUSED":
+            return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; development stopped."
+        return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after fast retries. State was saved; retry later."
+
     def run(self, task: str) -> str:
         self.git.ensure_repo()
         self.git.checkpoint("checkpoint: before autonomous task")
@@ -110,35 +127,23 @@ class Orchestrator:
         repeated = 0
         last_sig = ""
         escape_used = 0
-        force_gemini_next = False
 
         while True:
-            project = self.context.build()
+            project = self._select_context(task, latest_failure)
             prompt = f"""USER TASK:
 {task}
 
-CURRENT PROJECT:
+RELEVANT PROJECT CONTEXT:
 {project}
 
 LATEST FAILURE:
 {latest_failure or "(none)"}
 """
             system = FIXER_SYSTEM if latest_failure else MANAGER_SYSTEM
-            reason = "fixing failure" if latest_failure else "initial implementation"
-            if force_gemini_next:
-                reason = "repeated local failure"
-            plan = self._call_structured(
-                system,
-                prompt,
-                DevPlan,
-                prefer_local=not force_gemini_next,
-                reason=reason,
-            )
-            force_gemini_next = False
-            if plan == "QUOTA_PAUSED":
-                return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
-            if plan == "TEMPORARILY_UNAVAILABLE":
-                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after fast retries. State was saved; retry later."
+            reason = "fixing failure" if latest_failure else "implementation"
+            plan = self._gemini_call(system, prompt, DevPlan, reason)
+            if isinstance(plan, str):
+                return self._pause_message(plan)
             self.state.add("plan", plan.model_dump())
 
             logs = self._apply_plan(plan)
@@ -155,44 +160,40 @@ LATEST FAILURE:
                     if escape_used < self.escape_attempts:
                         escape_used += 1
                         latest_failure += (
-                            "\n\nSTUCK WARNING: Local-first fixes repeated the same failure. "
-                            "Escalate to Gemini and abandon the prior approach for a materially different solution."
+                            "\n\nSTUCK WARNING: The same failure repeated. "
+                            "Abandon the prior approach and choose a materially different solution."
                         )
                         repeated = 0
-                        force_gemini_next = True
                         continue
                     self.state.add("stopped", {"reason": "STUCK_DETECTED", "failure": latest_failure})
                     return "STOPPED: STUCK_DETECTED\n" + latest_failure
                 continue
 
+            if not plan.done:
+                latest_failure = "CONTINUE_IMPLEMENTATION: Previous plan completed without command failure but task is not done."
+                continue
+
+            review_context = self._select_context(task)
             review_prompt = f"""TASK:
 {task}
 
-PROJECT:
-{self.context.build()}
+RELEVANT PROJECT CONTEXT:
+{review_context}
 
 LATEST EXECUTION EVIDENCE:
 {evidence or "(no commands were run)"}
 """
-            review = self._call_structured(
-                REVIEW_SYSTEM,
-                review_prompt,
-                ReviewResult,
-                prefer_local=True,
-                reason="final review",
-            )
-            if review == "QUOTA_PAUSED":
-                return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
-            if review == "TEMPORARILY_UNAVAILABLE":
-                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after fast retries. State was saved; retry later."
+            review = self._gemini_call(REVIEW_SYSTEM, review_prompt, ReviewResult, "final review")
+            if isinstance(review, str):
+                return self._pause_message(review)
             self.state.add("review", review.model_dump())
 
-            if review.approved and plan.done:
+            if review.approved:
                 if self.config.get("auto_commit", True):
                     self.git.checkpoint(f"auto-dev: {task[:72]}")
                 return "COMPLETED: task implemented, reviewed, and checkpointed."
 
             latest_failure = (
-                "REVIEW_NOT_APPROVED:\n" +
-                (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
+                "REVIEW_NOT_APPROVED:\n"
+                + (review.next_instruction or "\n".join(review.issues) or "Continue implementing the task.")
             )
