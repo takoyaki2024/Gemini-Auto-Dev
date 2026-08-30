@@ -44,17 +44,41 @@ class Orchestrator:
         stuck = config.get("stuck", {})
         self.identical_limit = int(stuck.get("identical_error_limit", 3))
         self.escape_attempts = int(stuck.get("escape_attempts", 1))
+        local = config.get("local_ai", {})
+        self.local_call_limit = max(0, int(local.get("max_calls_before_gemini", 2)))
+        self.local_calls = 0
 
     @staticmethod
     def _sig(text: str) -> str:
         normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())
         return hashlib.sha256(normalized[-12000:].encode("utf-8", "ignore")).hexdigest()
 
-    def _call_structured(self, system: str, prompt: str, schema, prefer_local: bool = True):
+    def _call_structured(self, system: str, prompt: str, schema, prefer_local: bool = True, reason: str = ""):
+        local_budget_available = self.local_calls < self.local_call_limit
+        use_local = prefer_local and local_budget_available
+
+        if prefer_local and not local_budget_available:
+            message = f"Escalating to Gemini: local fast-mode budget exhausted ({self.local_calls}/{self.local_call_limit})"
+            if reason:
+                message += f"; reason={reason}"
+            print(message)
+            self.state.add("ai_escalation", {"reason": reason or "local_budget_exhausted", "local_calls": self.local_calls})
+        elif not prefer_local:
+            message = "Escalating to Gemini: local AI bypassed for this step"
+            if reason:
+                message += f"; reason={reason}"
+            print(message)
+            self.state.add("ai_escalation", {"reason": reason or "forced_gemini", "local_calls": self.local_calls})
+
         try:
-            result, backend = self.ai.structured(system, prompt, schema, prefer_local=prefer_local)
-            self.state.add("ai_call", {"backend": backend, "schema": schema.__name__})
-            print(f"AI backend: {backend}")
+            result, backend = self.ai.structured(system, prompt, schema, prefer_local=use_local)
+            if backend == "local":
+                self.local_calls += 1
+            self.state.add(
+                "ai_call",
+                {"backend": backend, "schema": schema.__name__, "reason": reason, "local_calls": self.local_calls},
+            )
+            print(f"AI backend: {backend} | reason: {reason or 'normal'}")
             return result
         except GeminiQuotaPaused as exc:
             self.state.add("paused", {"reason": "QUOTA_PAUSED", "error": str(exc)})
@@ -100,12 +124,21 @@ LATEST FAILURE:
 {latest_failure or "(none)"}
 """
             system = FIXER_SYSTEM if latest_failure else MANAGER_SYSTEM
-            plan = self._call_structured(system, prompt, DevPlan, prefer_local=not force_gemini_next)
+            reason = "fixing failure" if latest_failure else "initial implementation"
+            if force_gemini_next:
+                reason = "repeated local failure"
+            plan = self._call_structured(
+                system,
+                prompt,
+                DevPlan,
+                prefer_local=not force_gemini_next,
+                reason=reason,
+            )
             force_gemini_next = False
             if plan == "QUOTA_PAUSED":
                 return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
             if plan == "TEMPORARILY_UNAVAILABLE":
-                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after automatic retries. State was saved; retry later."
+                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after fast retries. State was saved; retry later."
             self.state.add("plan", plan.model_dump())
 
             logs = self._apply_plan(plan)
@@ -141,11 +174,17 @@ PROJECT:
 LATEST EXECUTION EVIDENCE:
 {evidence or "(no commands were run)"}
 """
-            review = self._call_structured(REVIEW_SYSTEM, review_prompt, ReviewResult, prefer_local=True)
+            review = self._call_structured(
+                REVIEW_SYSTEM,
+                review_prompt,
+                ReviewResult,
+                prefer_local=True,
+                reason="final review",
+            )
             if review == "QUOTA_PAUSED":
                 return "PAUSED: QUOTA_PAUSED. Free-tier/API quota was reached. State was saved; retry later."
             if review == "TEMPORARILY_UNAVAILABLE":
-                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after automatic retries. State was saved; retry later."
+                return "PAUSED: TEMPORARILY_UNAVAILABLE. Gemini stayed busy after fast retries. State was saved; retry later."
             self.state.add("review", review.model_dump())
 
             if review.approved and plan.done:
