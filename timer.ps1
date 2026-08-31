@@ -1,16 +1,17 @@
 $ErrorActionPreference = 'Stop'
 
-$inputTime = Read-Host 'Start time (HH:mm)'
+$inputTime = Read-Host 'Start time (H:mm or HH:mm)'
 $parsed = [DateTime]::MinValue
+$formats = @('H:mm', 'HH:mm')
 
 if (-not [DateTime]::TryParseExact(
     $inputTime.Trim(),
-    'HH:mm',
+    $formats,
     [System.Globalization.CultureInfo]::InvariantCulture,
     [System.Globalization.DateTimeStyles]::None,
     [ref]$parsed
 )) {
-    Write-Host 'Invalid time. Example: 20:30' -ForegroundColor Red
+    Write-Host 'Invalid time. Example: 0:59 or 20:30' -ForegroundColor Red
     exit 1
 }
 
