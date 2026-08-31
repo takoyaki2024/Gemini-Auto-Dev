@@ -2,17 +2,43 @@
 
 Codex の 5時間利用枠がリセットされる時刻に、Windows へ通知を出す小さなツールです。
 
-OpenAI の公式案内では、Codex の現在の利用枠とリセット時刻は **Settings → Usage** または Codex CLI の **`/status`** で確認できます。
+現在は2方式あります。
 
-この v1 は OpenAI アカウントへ自動ログインしたり、APIを消費して確認したりしません。表示されたリセット時刻を1回入力すると、その時刻までバックグラウンドで待機して通知します。
+## 1. 自動検出モード（推奨）
 
-## 使い方
+`start-auto.bat` を起動すると、`%USERPROFILE%\.codex` 配下のローカル履歴ファイルから、Codex が表示した利用上限メッセージや `5h limit ... resets ...` の時刻を探します。
 
-1. このリポジトリを `git pull` する
-2. Codex で `/status` を開くか Settings → Usage を開く
-3. 表示された 5時間枠のリセット時刻を確認する
-4. `set-reset.bat` をダブルクリックする
-5. `HH:mm` または `yyyy-MM-dd HH:mm` 形式で入力する
+検出できた例:
+
+```text
+You've hit your usage limit ... try again at Sep 13th, 2026 7:11 PM
+```
+
+```text
+5h limit: 0% left (resets 16:10)
+```
+
+未来のリセット時刻を検出すると、その時刻まで待機して Windows のメッセージ通知を出します。
+
+### 自動検出モードの特徴
+
+- OpenAI APIを呼ばない
+- APIキー不要
+- モデルを消費する定期プローブを行わない
+- `auth.json` と `config.toml` は読み取り対象から除外
+- ローカルPC内だけで処理
+- 30秒ごとにローカル履歴だけを確認
+
+### 注意
+
+Codex のローカルファイル形式は将来変更される可能性があります。また、Codex がリセット時刻をローカル履歴へ残さないケースでは自動検出できません。その場合は手動モードを使ってください。
+
+## 2. 手動モード
+
+Codex の Settings → Usage や `/status` などに表示されたリセット時刻を入力して通知予約します。
+
+1. `set-reset.bat` をダブルクリック
+2. `HH:mm` または `yyyy-MM-dd HH:mm` 形式で入力
 
 例:
 
@@ -30,15 +56,24 @@ OpenAI の公式案内では、Codex の現在の利用枠とリセット時刻�
 
 通知予約を取り消す場合は `cancel-reset.bat` を実行します。
 
+## ファイル
+
+- `start-auto.bat` — 自動検出を開始
+- `auto-watch.ps1` — Codexローカル履歴を監視して自動通知
+- `set-reset.bat` — 手動通知設定
+- `set-reset.ps1` — 手動設定処理
+- `watch-reset.ps1` — 手動モードの待機・通知
+- `cancel-reset.bat` — 手動通知の取消
+- `cancel-reset.ps1` — 手動通知の取消処理
+
 ## 方針
 
-- APIキー不要
-- OpenAI API利用なし
 - 追加料金なし
+- OpenAI API利用なし
 - 外部Pythonパッケージ不要
 - Windows標準PowerShellのみ
-- 通知時刻はローカルPC時刻を使用
+- 認証情報を外部へ送信しない
 
-## 今後の拡張
+## 今後
 
-Codex が機械読み取り可能な利用状況・リセット時刻を公式に取得できる方法を提供している場合は、その方法を使って入力作業自体も自動化できます。現時点の v1 は、利用枠確認のためだけにモデル呼び出しを行って残り枠を消費する方式は採用しません。
+Codex が将来、公式の機械読み取り可能な usage/status コマンドやAPIを提供した場合は、ローカル履歴解析より公式手段を優先します。
