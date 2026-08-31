@@ -57,37 +57,47 @@ function Find-LatestResetTime {
     return $null
 }
 
-function Notify([DateTime]$target) {
+function Show-ResetNotification([DateTime]$target) {
     try {
         Add-Type -AssemblyName PresentationFramework
         [System.Media.SystemSounds]::Exclamation.Play()
+        $message = 'Codex 5-hour usage window should now be reset. You can resume Codex.'
+        $title = 'Codex Reset Notifier'
         [System.Windows.MessageBox]::Show(
-            'Codex の利用枠がリセット時刻になりました。Codexを再開できます。',
-            'Codex Reset Notifier',
+            $message,
+            $title,
             [System.Windows.MessageBoxButton]::OK,
             [System.Windows.MessageBoxImage]::Information
         ) | Out-Null
-    } catch { }
+    } catch {
+        Write-Host 'Codex reset time reached.'
+    }
 }
 
-Write-Host 'Codexのローカル履歴からリセット時刻を自動検出します。Ctrl+Cで停止できます。'
+Write-Host 'Watching local Codex history for a 5-hour reset time. Press Ctrl+C to stop.'
 
 while ($true) {
     $target = Find-LatestResetTime
+
     if ($target) {
         $key = $target.ToString('o')
-        $last = if (Test-Path $stateFile) { (Get-Content $stateFile -Raw).Trim() } else { '' }
+        if (Test-Path $stateFile) {
+            $last = (Get-Content $stateFile -Raw).Trim()
+        } else {
+            $last = ''
+        }
 
         if ($key -ne $last) {
-            Write-Host ('検出: ' + $target.ToString('yyyy-MM-dd HH:mm'))
+            Write-Host ('Detected reset time: ' + $target.ToString('yyyy-MM-dd HH:mm'))
             $key | Set-Content $stateFile -Encoding UTF8
 
             while ((Get-Date) -lt $target) {
                 $remaining = $target - (Get-Date)
-                Start-Sleep -Seconds ([Math]::Min([Math]::Max([int]$remaining.TotalSeconds, 1), 30))
+                $seconds = [Math]::Min([Math]::Max([int]$remaining.TotalSeconds, 1), 30)
+                Start-Sleep -Seconds $seconds
             }
 
-            Notify $target
+            Show-ResetNotification $target
         }
     }
 
